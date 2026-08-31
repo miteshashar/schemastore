@@ -29,6 +29,7 @@ import {
   checkRequiredCoverage,
   checkDefaultCoverage,
   checkNegativeIsolation,
+  checkNegativeAssertionsBite,
   printCoverageReport,
 } from './src/helpers/coverage.js'
 import minimist from 'minimist'
@@ -2244,7 +2245,38 @@ EXAMPLES:
         negativeTests.set(testfile, file.json)
       }
 
-      // Run all 8 checks
+      // Which assertions in those files still bite? Check 9 needs the error
+      // list, and validation lives here because `coverage.js` is deliberately
+      // free of an Ajv dependency.
+      const negativeErrors = new Map()
+      if (negativeTests.size > 0) {
+        try {
+          const schemaDialect = getSchemaDialect(
+            /** @type {string} */ (schema.$schema),
+          )
+          const schemaOptions = getSchemaOptions(schemaName)
+          const ajv = await ajvFactory({
+            draftVersion: schemaDialect.draftVersion,
+            fullStrictMode:
+              !SchemaValidation.ajvNotStrictMode.includes(schemaName),
+            unknownFormats: schemaOptions.unknownFormats,
+            unknownKeywords: schemaOptions.unknownKeywords,
+            unknownSchemas: schemaOptions.unknownSchemas,
+            options: { allErrors: true },
+          })
+          const validateFn = ajv.compile(schema)
+          for (const [testfile, testData] of negativeTests) {
+            validateFn(testData)
+            negativeErrors.set(testfile, validateFn.errors ?? [])
+          }
+        } catch {
+          // Leave the map empty; check 9 then reports skip rather than
+          // taking down a coverage run over a schema it cannot compile.
+          negativeErrors.clear()
+        }
+      }
+
+      // Run all 9 checks
       const results = [
         { name: '1. Unused $defs', result: checkUnusedDefs(schema) },
         {
@@ -2274,6 +2306,14 @@ EXAMPLES:
         {
           name: '8. Negative Test Isolation',
           result: checkNegativeIsolation(schema, negativeTests),
+        },
+        {
+          name: '9. Negative Assertions Bite',
+          result: checkNegativeAssertionsBite(
+            schema,
+            negativeTests,
+            negativeErrors,
+          ),
         },
       ]
 

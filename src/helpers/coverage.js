@@ -858,6 +858,294 @@ export function checkNegativeIsolation(schema, negativeTests) {
 }
 
 // ---------------------------------------------------------------------------
+// Check 9: negative test assertions that no longer bite
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a local `$ref`, keeping any sibling keywords on the referring node.
+ * @param {Record<string, any>} node
+ * @param {Record<string, any>} root
+ * @returns {Record<string, any>}
+ */
+function derefLocal(node, root) {
+  let hops = 0
+  while (node && typeof node.$ref === 'string' && node.$ref.startsWith('#')) {
+    if (hops++ > 20) break
+    const segments = node.$ref
+      .slice(1)
+      .split('/')
+      .filter(Boolean)
+      .map((s) => s.replace(/~1/g, '/').replace(/~0/g, '~'))
+    let target = root
+    for (const segment of segments) target = target?.[segment]
+    if (!target || typeof target !== 'object') break
+    const siblings = Object.fromEntries(
+      Object.entries(node).filter(([k]) => k !== '$ref'),
+    )
+    node = { ...target, ...siblings }
+  }
+  return node
+}
+
+/**
+ * Every subschema that can apply to one instance location.
+ *
+ * All of anyOf/oneOf/allOf/if/then/else and dependent schemas are collected,
+ * because any of them may be the branch that declares a property. Judging a
+ * location against one branch alone reports the properties of its siblings as
+ * unconstrained.
+ * @param {Record<string, any>} node
+ * @param {Record<string, any>} root
+ * @returns {Record<string, any>[]}
+ */
+function applicableBranches(node, root) {
+  const branches = []
+  const seed = derefLocal(node, root)
+  if (!seed || typeof seed !== 'object') return branches
+  branches.push(seed)
+  for (const keyword of ['anyOf', 'oneOf', 'allOf']) {
+    if (Array.isArray(seed[keyword])) {
+      for (const variant of seed[keyword]) {
+        branches.push(...applicableBranches(variant, root))
+      }
+    }
+  }
+  for (const keyword of ['if', 'then', 'else']) {
+    if (seed[keyword] && typeof seed[keyword] === 'object') {
+      branches.push(...applicableBranches(seed[keyword], root))
+    }
+  }
+  for (const keyword of ['dependentSchemas', 'dependencies']) {
+    const dependents = seed[keyword]
+    if (dependents && typeof dependents === 'object') {
+      for (const dependent of Object.values(dependents)) {
+        if (
+          dependent &&
+          typeof dependent === 'object' &&
+          !Array.isArray(dependent)
+        ) {
+          branches.push(...applicableBranches(dependent, root))
+        }
+      }
+    }
+  }
+  return branches
+}
+
+/**
+ * JSON pointers named by Ajv errors, including the pointer of the offending
+ * key for errors that report it in `params` rather than in `instancePath`.
+ * @param {Array<{instancePath: string, params?: Record<string, unknown>}>} errors
+ * @returns {Set<string>}
+ */
+function errorPointers(errors) {
+  const pointers = new Set()
+  for (const error of errors ?? []) {
+    pointers.add(error.instancePath)
+    const params = error.params ?? {}
+    for (const key of [
+      'additionalProperty',
+      'missingProperty',
+      'propertyName',
+    ]) {
+      if (typeof params[key] === 'string') {
+        pointers.add(`${error.instancePath}/${params[key]}`)
+      }
+    }
+  }
+  return pointers
+}
+
+/**
+ * Does this pointer, or anything beneath it, produce a validation error?
+ * @param {Set<string>} pointers
+ * @param {string} pointer
+ * @returns {boolean}
+ */
+function bites(pointers, pointer) {
+  for (const candidate of pointers) {
+    if (candidate === pointer || candidate.startsWith(`${pointer}/`))
+      return true
+  }
+  return false
+}
+
+/**
+ * Collect properties present in the data that the schema constrains in no way.
+ * @param {unknown} data
+ * @param {Record<string, any>} schemaNode
+ * @param {Record<string, any>} root
+ * @param {string} pointer
+ * @param {Set<string>} pointers
+ * @param {string[]} found
+ * @param {number} [depth]
+ */
+function findInertProperties(
+  data,
+  schemaNode,
+  root,
+  pointer,
+  pointers,
+  found,
+  depth = 0,
+) {
+  if (depth > 12 || !data || typeof data !== 'object') return
+  const branches = applicableBranches(schemaNode, root)
+
+  if (Array.isArray(data)) {
+    for (const [index, item] of data.entries()) {
+      const subschemas = []
+      for (const branch of branches) {
+        const items = Array.isArray(branch.items)
+          ? branch.items[index]
+          : branch.items
+        if (items && typeof items === 'object') subschemas.push(items)
+        const prefix = Array.isArray(branch.prefixItems)
+          ? branch.prefixItems[index]
+          : null
+        if (prefix && typeof prefix === 'object') subschemas.push(prefix)
+      }
+      if (subschemas.length > 0) {
+        findInertProperties(
+          item,
+          { allOf: subschemas },
+          root,
+          `${pointer}/${index}`,
+          pointers,
+          found,
+          depth + 1,
+        )
+      }
+    }
+    return
+  }
+
+  const named = new Set()
+  // A container whose extra keys are described by an `additionalProperties`
+  // schema or by `patternProperties` is a map: its key names are the user's to
+  // choose.
+  let isMap = false
+  for (const branch of branches) {
+    if (branch.properties && typeof branch.properties === 'object') {
+      for (const key of Object.keys(branch.properties)) named.add(key)
+    }
+    if (
+      branch.additionalProperties &&
+      typeof branch.additionalProperties === 'object'
+    ) {
+      isMap = true
+    }
+    if (
+      branch.patternProperties &&
+      typeof branch.patternProperties === 'object'
+    ) {
+      isMap = true
+    }
+  }
+
+  for (const [key, value] of Object.entries(data)) {
+    if (key === '$schema' && pointer === '') continue
+    const childPointer = `${pointer}/${key}`
+
+    if (named.has(key)) {
+      // Recurse once against every applicable branch at the same time. Per
+      // branch, a narrow if/then shape would report the child's siblings as
+      // unconstrained.
+      const subschemas = []
+      for (const branch of branches) {
+        const subschema = branch.properties?.[key]
+        if (subschema && typeof subschema === 'object')
+          subschemas.push(subschema)
+      }
+      if (subschemas.length > 0) {
+        findInertProperties(
+          value,
+          { allOf: subschemas },
+          root,
+          childPointer,
+          pointers,
+          found,
+          depth + 1,
+        )
+      }
+      continue
+    }
+
+    // No named vocabulary at all: a free-form map, where an unrecognised key
+    // asserts nothing about the schema.
+    if (named.size === 0) continue
+    // The key, or something beneath it, is the assertion.
+    if (bites(pointers, childPointer)) continue
+    // In a map the key name is the user's, so a quiet key is only suspect when
+    // a sibling does bite — that is a container being used as a list of
+    // assertions, one of which has gone quiet. Without this, every minimal
+    // valid stub written to reach an assertion elsewhere is reported.
+    if (isMap) {
+      const siblingBites = Object.keys(data).some(
+        (sibling) =>
+          sibling !== key && bites(pointers, `${pointer}/${sibling}`),
+      )
+      if (!siblingBites) continue
+    }
+
+    found.push(childPointer)
+  }
+}
+
+/**
+ * Check 9: report properties in negative tests that assert nothing.
+ *
+ * A negative test file holds many independent assertions, and the file only has
+ * to fail once. Remove a property, an enum member or a pattern from the schema
+ * and every negative test entry for it becomes valid, while the file keeps
+ * failing on its remaining entries — so the suite stays green and the dead
+ * assertion is invisible.
+ *
+ * Reported properties are accepted by every branch of the schema that applies
+ * to them. Known gap: an entry that has gone quiet while sitting alone in a map
+ * container is not reported, for the reason given at the `isMap` test above.
+ * @param {Record<string, any>} schema
+ * @param {Map<string, unknown>} negativeTests
+ * @param {Map<string, Array<{instancePath: string, params?: Record<string, unknown>}>>} [negativeErrors]
+ * @returns {{status: string, [key: string]: unknown}}
+ */
+export function checkNegativeAssertionsBite(
+  schema,
+  negativeTests,
+  negativeErrors,
+) {
+  if (negativeTests.size === 0) {
+    return { status: 'skip', reason: 'No negative tests' }
+  }
+  if (!negativeErrors || negativeErrors.size === 0) {
+    return { status: 'skip', reason: 'No validation errors supplied' }
+  }
+
+  const inertFiles = []
+  for (const [filename, data] of negativeTests) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+    const found = []
+    findInertProperties(
+      data,
+      schema,
+      schema,
+      '',
+      errorPointers(negativeErrors.get(filename) ?? []),
+      found,
+    )
+    const properties = [...new Set(found)]
+    if (properties.length > 0) inertFiles.push({ file: filename, properties })
+  }
+
+  return {
+    status: inertFiles.length === 0 ? 'pass' : 'warn',
+    totalNegativeTests: negativeTests.size,
+    note: 'Each reported property is accepted by every branch of the schema that applies to it, so its presence in a negative test asserts nothing. The usual cause is that the property, enum member or pattern it was written against has since been removed from the schema. Fix by restoring the assertion against a constraint that still exists, or by deleting the entry',
+    inertAssertions: inertFiles,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Coverage report output
 // ---------------------------------------------------------------------------
 
@@ -865,6 +1153,9 @@ function formatIssue(item) {
   if (typeof item !== 'object' || item === null) return String(item)
   if (item.file && item.violations) {
     return `${item.file}: ${item.violations.join(', ')}`
+  }
+  if (item.file && item.properties) {
+    return `${item.file}: ${item.properties.join(', ')}`
   }
   const parts = [item.path]
   if (item.type) parts.push(item.type)
